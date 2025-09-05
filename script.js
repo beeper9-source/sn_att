@@ -31,11 +31,16 @@ const ATTENDANCE_TYPES = {
 // 휴강일 설정
 const HOLIDAY_SESSIONS = [5]; // 5회차 휴강
 
-// 출석 데이터 저장소 (로컬스토리지 사용)
+// 출석 데이터 저장소 (로컬스토리지 + JSONBin.io 사용)
 class AttendanceManager {
     constructor() {
         this.storageKey = 'chamber_attendance';
         this.data = this.loadData();
+        this.isOnline = navigator.onLine;
+        this.jsonBinId = '65f8a8b8dc74654018a8b123'; // JSONBin.io 컨테이너 ID
+        this.jsonBinApiKey = '$2a$10$8K1p/a0dL1pK1p/a0dL1pK1p/a0dL1pK1p/a0dL1pK1p/a0dL1pK1p/a0dL1pK'; // 공개 API 키
+        this.syncInterval = null;
+        this.setupCloudSync();
     }
 
     loadData() {
@@ -51,13 +56,16 @@ class AttendanceManager {
     }
 
     saveData() {
-        try {
-            localStorage.setItem(this.storageKey, JSON.stringify(this.data));
-            return true;
-        } catch (e) {
-            console.error('데이터 저장 실패:', e);
-            return false;
+        // 로컬스토리지에 저장
+        const localSuccess = this.saveToLocal();
+        
+        // JSONBin.io에 저장 (온라인인 경우)
+        let cloudSuccess = true;
+        if (this.isOnline) {
+            cloudSuccess = this.saveToCloud();
         }
+        
+        return localSuccess && cloudSuccess;
     }
 
     getAttendance(session, memberNo) {
@@ -141,6 +149,90 @@ class AttendanceManager {
         return instrumentSummary;
     }
 
+    setupCloudSync() {
+        // JSONBin.io를 사용한 간단한 클라우드 동기화
+        console.log('JSONBin.io 클라우드 동기화 설정');
+        
+        // 주기적으로 클라우드에서 데이터 동기화 (30초마다)
+        this.syncInterval = setInterval(() => {
+            if (this.isOnline) {
+                this.loadFromCloud();
+            }
+        }, 30000);
+    }
+
+    async saveToCloud() {
+        if (!this.isOnline) return false;
+
+        try {
+            const response = await fetch(`https://api.jsonbin.io/v3/b/${this.jsonBinId}`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Master-Key': this.jsonBinApiKey
+                },
+                body: JSON.stringify(this.data)
+            });
+
+            if (response.ok) {
+                console.log('JSONBin.io에 데이터 저장 완료');
+                return true;
+            } else {
+                console.error('JSONBin.io 저장 실패:', response.status);
+                return false;
+            }
+        } catch (error) {
+            console.error('JSONBin.io 저장 오류:', error);
+            return false;
+        }
+    }
+
+    async loadFromCloud() {
+        if (!this.isOnline) return false;
+
+        try {
+            const response = await fetch(`https://api.jsonbin.io/v3/b/${this.jsonBinId}/latest`, {
+                headers: {
+                    'X-Master-Key': this.jsonBinApiKey
+                }
+            });
+
+            if (response.ok) {
+                const result = await response.json();
+                const cloudData = result.record;
+                
+                if (cloudData && JSON.stringify(cloudData) !== JSON.stringify(this.data)) {
+                    console.log('JSONBin.io에서 데이터 업데이트 감지');
+                    this.data = cloudData;
+                    this.saveToLocal();
+                    this.notifyUIUpdate();
+                }
+                return true;
+            } else {
+                console.error('JSONBin.io 로드 실패:', response.status);
+                return false;
+            }
+        } catch (error) {
+            console.error('JSONBin.io 로드 오류:', error);
+            return false;
+        }
+    }
+
+    saveToLocal() {
+        try {
+            localStorage.setItem(this.storageKey, JSON.stringify(this.data));
+            return true;
+        } catch (e) {
+            console.error('로컬 저장 실패:', e);
+            return false;
+        }
+    }
+
+    notifyUIUpdate() {
+        // UI 업데이트를 위한 이벤트 발생
+        window.dispatchEvent(new CustomEvent('attendanceDataUpdated'));
+    }
+
     notifyChange(session, memberNo, status) {
         // 다른 탭이나 창에 변경사항 알림
         if (typeof BroadcastChannel !== 'undefined') {
@@ -188,6 +280,12 @@ function initializeApp() {
     renderMemberList();
     updateSummary();
     updateSessionDates();
+    
+    // Firebase 데이터 업데이트 이벤트 리스너
+    window.addEventListener('attendanceDataUpdated', function() {
+        renderMemberList();
+        updateSummary();
+    });
 }
 
 function setupEventListeners() {
@@ -394,14 +492,22 @@ function saveAndSync() {
         // 저장 성공 시 동기화 시작
         saveSyncBtn.textContent = '동기화 중...';
         
-        setTimeout(() => {
-            // 동기화 작업 (로컬스토리지 새로고침)
-            attendanceManager.data = attendanceManager.loadData();
+        setTimeout(async () => {
+            // JSONBin.io에서 최신 데이터 로드
+            if (attendanceManager.isOnline) {
+                await attendanceManager.loadFromCloud();
+            } else {
+                // 오프라인인 경우 로컬 데이터 새로고침
+                attendanceManager.data = attendanceManager.loadData();
+            }
+            
             renderMemberList();
             updateSummary();
             
             // 성공 상태 표시
-            saveSyncBtn.textContent = '저장 및 동기화 완료!';
+            const statusText = attendanceManager.isOnline ? 
+                '저장 및 동기화 완료!' : '로컬 저장 완료 (오프라인)';
+            saveSyncBtn.textContent = statusText;
             saveSyncBtn.classList.remove('saving');
             saveSyncBtn.classList.add('success');
             
@@ -460,14 +566,15 @@ window.addEventListener('beforeunload', function() {
 // 오프라인/온라인 상태 감지
 window.addEventListener('online', function() {
     console.log('온라인 상태로 복구됨');
-    // 간단한 동기화만 수행
-    attendanceManager.data = attendanceManager.loadData();
-    renderMemberList();
-    updateSummary();
+    attendanceManager.isOnline = true;
+    
+    // JSONBin.io에서 최신 데이터 동기화
+    attendanceManager.loadFromCloud();
 });
 
 window.addEventListener('offline', function() {
     console.log('오프라인 상태');
+    attendanceManager.isOnline = false;
 });
 
 // PWA 지원을 위한 서비스 워커 등록 (선택사항)
